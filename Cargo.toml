@@ -1,0 +1,9 @@
+[package]
+name = "tmnl-protocol"
+version = "0.0.1"
+edition = "2024"
+description = "Binary wire protocol between the tmnl terminal and a backing app (e.g. mnml)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
