@@ -22,6 +22,12 @@ pub const MSG_TITLE: u8 = 6;
 /// <socket>`). Used by mnml's `mixr.show` to bring up mixr as a
 /// sibling pane. Added after v3 — optional on older renderers.
 pub const MSG_OPEN_PANE: u8 = 7;
+/// `Message::Palette { bg, fg, accent }` — server → client. The host
+/// (e.g. mnml) hands a hosted app its active theme colors so the app
+/// can re-theme to match its container. Three packed-rgba values (see
+/// [`pack_rgba_u8`]). Sent right after the connect handshake. Added
+/// after v3 — optional; a client that ignores it keeps its own theme.
+pub const MSG_PALETTE: u8 = 8;
 
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
@@ -173,6 +179,15 @@ pub enum Message {
         command: String,
         args: Vec<String>,
     },
+    /// Server → client: the host's active theme palette so a hosted
+    /// app can re-theme to match its container. `bg` / `fg` / `accent`
+    /// are packed rgba (see [`pack_rgba_u8`] / [`unpack_rgba`]). See
+    /// [`MSG_PALETTE`].
+    Palette {
+        bg: u32,
+        fg: u32,
+        accent: u32,
+    },
 }
 
 pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
@@ -238,6 +253,12 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
                 buf.extend_from_slice(&al.to_le_bytes());
                 buf.extend_from_slice(&ab[..al as usize]);
             }
+        }
+        Message::Palette { bg, fg, accent } => {
+            buf.push(MSG_PALETTE);
+            buf.extend_from_slice(&bg.to_le_bytes());
+            buf.extend_from_slice(&fg.to_le_bytes());
+            buf.extend_from_slice(&accent.to_le_bytes());
         }
     }
     let payload_len = (buf.len() - 4) as u32;
@@ -375,6 +396,12 @@ fn decode_payload(p: &[u8]) -> io::Result<Message> {
                 })?);
             }
             Ok(Message::OpenPane { command, args })
+        }
+        MSG_PALETTE => {
+            let bg = c.u32()?;
+            let fg = c.u32()?;
+            let accent = c.u32()?;
+            Ok(Message::Palette { bg, fg, accent })
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -559,4 +586,28 @@ pub fn unpack_rgba(c: u32) -> [f32; 4] {
 #[allow(dead_code)]
 pub fn pack_rgba_u8(r: u8, g: u8, b: u8, a: u8) -> u32 {
     ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | (a as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_message_round_trips() {
+        let msg = Message::Palette {
+            bg: pack_rgba_u8(0x1e, 0x22, 0x2a, 0xff),
+            fg: pack_rgba_u8(0xab, 0xb2, 0xbf, 0xff),
+            accent: pack_rgba_u8(0x61, 0xaf, 0xef, 0xff),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        match read_message(&mut &buf[..]).unwrap() {
+            Message::Palette { bg, fg, accent } => {
+                assert_eq!(bg, pack_rgba_u8(0x1e, 0x22, 0x2a, 0xff));
+                assert_eq!(fg, pack_rgba_u8(0xab, 0xb2, 0xbf, 0xff));
+                assert_eq!(accent, pack_rgba_u8(0x61, 0xaf, 0xef, 0xff));
+            }
+            other => panic!("expected Palette, got {other:?}"),
+        }
+    }
 }
