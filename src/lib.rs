@@ -80,13 +80,13 @@ pub struct WireCell {
     pub attrs: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiffRun {
     pub start: u32,
     pub cells: Vec<WireCell>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     pub seq: u64,
     pub cols: u16,
@@ -98,13 +98,13 @@ pub struct Frame {
     pub runs: Vec<DiffRun>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Resize {
     pub cols: u16,
     pub rows: u16,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum KeyCode {
     Char(char),
     Backspace,
@@ -125,7 +125,7 @@ pub enum KeyCode {
     F(u8),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KeyInput {
     pub code: KeyCode,
     pub mods: u8,
@@ -144,7 +144,7 @@ pub enum MouseKind {
     ScrollRight,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MouseInput {
     pub kind: MouseKind,
     pub button: u8,
@@ -153,13 +153,13 @@ pub struct MouseInput {
     pub mods: u8,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputEvent {
     Key(KeyInput),
     Mouse(MouseInput),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Message {
     Hello {
         version: u32,
@@ -592,22 +592,163 @@ pub fn pack_rgba_u8(r: u8, g: u8, b: u8, a: u8) -> u32 {
 mod tests {
     use super::*;
 
+    /// Encode `msg`, decode it straight back, and assert it survived
+    /// the wire unchanged. The whole point of this crate is that this
+    /// holds for every `Message` variant — both ends depend on it.
+    fn round_trip(msg: Message) {
+        let mut buf: Vec<u8> = Vec::new();
+        write_message(&mut buf, &msg).expect("encode");
+        let got = read_message(&mut &buf[..]).expect("decode");
+        assert_eq!(got, msg, "round-trip changed the message");
+    }
+
     #[test]
-    fn palette_message_round_trips() {
-        let msg = Message::Palette {
+    fn hello_round_trips() {
+        round_trip(Message::Hello {
+            version: PROTOCOL_VERSION,
+        });
+        round_trip(Message::Hello { version: 0 });
+    }
+
+    #[test]
+    fn resize_round_trips() {
+        round_trip(Message::Resize(Resize {
+            cols: 200,
+            rows: 60,
+        }));
+        round_trip(Message::Resize(Resize { cols: 0, rows: 0 }));
+    }
+
+    #[test]
+    fn quit_round_trips() {
+        round_trip(Message::Quit);
+    }
+
+    #[test]
+    fn title_round_trips() {
+        round_trip(Message::Title("mnml — src/lib.rs".to_string()));
+        round_trip(Message::Title(String::new()));
+        round_trip(Message::Title("emoji 🎛 + spinner ✽".to_string()));
+    }
+
+    #[test]
+    fn open_pane_round_trips() {
+        round_trip(Message::OpenPane {
+            command: "mixr".to_string(),
+            args: vec!["--blit".to_string(), "/tmp/x.sock".to_string()],
+        });
+        round_trip(Message::OpenPane {
+            command: "sh".to_string(),
+            args: vec![],
+        });
+    }
+
+    #[test]
+    fn palette_round_trips() {
+        round_trip(Message::Palette {
             bg: pack_rgba_u8(0x1e, 0x22, 0x2a, 0xff),
             fg: pack_rgba_u8(0xab, 0xb2, 0xbf, 0xff),
             accent: pack_rgba_u8(0x61, 0xaf, 0xef, 0xff),
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        write_message(&mut buf, &msg).unwrap();
-        match read_message(&mut &buf[..]).unwrap() {
-            Message::Palette { bg, fg, accent } => {
-                assert_eq!(bg, pack_rgba_u8(0x1e, 0x22, 0x2a, 0xff));
-                assert_eq!(fg, pack_rgba_u8(0xab, 0xb2, 0xbf, 0xff));
-                assert_eq!(accent, pack_rgba_u8(0x61, 0xaf, 0xef, 0xff));
-            }
-            other => panic!("expected Palette, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn key_input_round_trips() {
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('✽'),
+            KeyCode::Backspace,
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::F(1),
+            KeyCode::F(12),
+        ] {
+            round_trip(Message::Input(InputEvent::Key(KeyInput {
+                code,
+                mods: MOD_CTRL | MOD_SHIFT,
+                press: true,
+            })));
         }
+    }
+
+    #[test]
+    fn mouse_input_round_trips() {
+        for kind in [
+            MouseKind::Down,
+            MouseKind::Up,
+            MouseKind::Drag,
+            MouseKind::Moved,
+            MouseKind::ScrollUp,
+            MouseKind::ScrollDown,
+            MouseKind::ScrollLeft,
+            MouseKind::ScrollRight,
+        ] {
+            round_trip(Message::Input(InputEvent::Mouse(MouseInput {
+                kind,
+                button: BUTTON_LEFT,
+                col: 12,
+                row: 34,
+                mods: MOD_ALT,
+            })));
+        }
+    }
+
+    #[test]
+    fn frame_round_trips() {
+        round_trip(Message::Frame(Frame {
+            seq: 42,
+            cols: 8,
+            rows: 2,
+            cursor_col: 3,
+            cursor_row: 1,
+            cursor_shape: 0,
+            cursor_visible: 1,
+            runs: vec![
+                DiffRun {
+                    start: 0,
+                    cells: vec![WireCell {
+                        ch: 'h' as u32,
+                        fg: 1,
+                        bg: 2,
+                        attrs: 3,
+                    }],
+                },
+                DiffRun {
+                    start: 10,
+                    cells: vec![
+                        WireCell {
+                            ch: 'i' as u32,
+                            fg: 4,
+                            bg: 5,
+                            attrs: 6,
+                        },
+                        WireCell::default(),
+                    ],
+                },
+            ],
+        }));
+        // A cursor-only frame — no runs.
+        round_trip(Message::Frame(Frame {
+            seq: 0,
+            cols: 1,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_shape: 1,
+            cursor_visible: 0,
+            runs: vec![],
+        }));
     }
 }
