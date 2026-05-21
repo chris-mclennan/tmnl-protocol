@@ -16,6 +16,12 @@ pub const MSG_QUIT: u8 = 5;
 /// added in v3, optional on older clients (renderer falls back to
 /// "mnml" / shell name).
 pub const MSG_TITLE: u8 = 6;
+/// `Message::OpenPane { command, args }` — client → server. The hosted
+/// app asks the renderer to open a *new* pane running `command args…`
+/// as its own native client (tmnl appends the minted `--blit
+/// <socket>`). Used by mnml's `mixr.show` to bring up mixr as a
+/// sibling pane. Added after v3 — optional on older renderers.
+pub const MSG_OPEN_PANE: u8 = 7;
 
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
@@ -160,6 +166,13 @@ pub enum Message {
     /// renderer uses it as the tab chip label (otherwise falls back
     /// to a default like "mnml" for the blit-style backend).
     Title(String),
+    /// Client → server: open a new pane running `command args…` as a
+    /// native client. tmnl splits + spawns it, appending the minted
+    /// `--blit <socket>`. See [`MSG_OPEN_PANE`].
+    OpenPane {
+        command: String,
+        args: Vec<String>,
+    },
 }
 
 pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
@@ -211,6 +224,20 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
             let len = (bytes.len() as u32).min(MAX_PAYLOAD.saturating_sub(8));
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&bytes[..len as usize]);
+        }
+        Message::OpenPane { command, args } => {
+            buf.push(MSG_OPEN_PANE);
+            let cmd = command.as_bytes();
+            let cmd_len = (cmd.len() as u32).min(MAX_PAYLOAD.saturating_sub(8));
+            buf.extend_from_slice(&cmd_len.to_le_bytes());
+            buf.extend_from_slice(&cmd[..cmd_len as usize]);
+            buf.extend_from_slice(&(args.len() as u32).to_le_bytes());
+            for a in args {
+                let ab = a.as_bytes();
+                let al = (ab.len() as u32).min(MAX_PAYLOAD.saturating_sub(8));
+                buf.extend_from_slice(&al.to_le_bytes());
+                buf.extend_from_slice(&ab[..al as usize]);
+            }
         }
     }
     let payload_len = (buf.len() - 4) as u32;
@@ -315,6 +342,39 @@ fn decode_payload(p: &[u8]) -> io::Result<Message> {
                 io::Error::new(io::ErrorKind::InvalidData, format!("bad utf-8 title: {e}"))
             })?;
             Ok(Message::Title(s))
+        }
+        MSG_OPEN_PANE => {
+            let cmd_len = c.u32()? as usize;
+            if cmd_len > 64 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("absurd command len {cmd_len}"),
+                ));
+            }
+            let command = String::from_utf8(c.take(cmd_len)?.to_vec()).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("bad utf-8 command: {e}"))
+            })?;
+            let n_args = c.u32()? as usize;
+            if n_args > 256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("absurd arg count {n_args}"),
+                ));
+            }
+            let mut args = Vec::with_capacity(n_args);
+            for _ in 0..n_args {
+                let al = c.u32()? as usize;
+                if al > 64 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("absurd arg len {al}"),
+                    ));
+                }
+                args.push(String::from_utf8(c.take(al)?.to_vec()).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad utf-8 arg: {e}"))
+                })?);
+            }
+            Ok(Message::OpenPane { command, args })
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
