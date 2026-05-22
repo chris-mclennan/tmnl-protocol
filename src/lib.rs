@@ -373,7 +373,10 @@ fn decode_payload(p: &[u8]) -> io::Result<Message> {
                 ));
             }
             let command = String::from_utf8(c.take(cmd_len)?.to_vec()).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("bad utf-8 command: {e}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad utf-8 command: {e}"),
+                )
             })?;
             let n_args = c.u32()? as usize;
             if n_args > 256 {
@@ -750,5 +753,29 @@ mod tests {
             cursor_visible: 0,
             runs: vec![],
         }));
+    }
+
+    #[test]
+    fn rgba_pack_unpack_round_trips() {
+        // pack_rgba_u8 lays bytes out as R<<24 | G<<16 | B<<8 | A.
+        assert_eq!(pack_rgba_u8(0x12, 0x34, 0x56, 0x78), 0x1234_5678);
+        // unpack_rgba is the inverse (as normalized floats).
+        let [r, g, b, a] = unpack_rgba(0x1234_5678);
+        assert!((r - 0x12 as f32 / 255.0).abs() < 1e-6);
+        assert!((g - 0x34 as f32 / 255.0).abs() < 1e-6);
+        assert!((b - 0x56 as f32 / 255.0).abs() < 1e-6);
+        assert!((a - 0x78 as f32 / 255.0).abs() < 1e-6);
+        // pack_rgba (float input) clamps to [0,1] then rounds.
+        assert_eq!(pack_rgba(1.0, 0.0, 0.0, 1.0), 0xff00_00ff);
+        assert_eq!(pack_rgba(2.0, -1.0, 0.0, 0.0), 0xff00_0000);
+    }
+
+    #[test]
+    fn read_message_rejects_an_unknown_type() {
+        // 4-byte LE length prefix (1) + a payload of one byte: msg
+        // type 99, which no variant claims ⇒ a clean decode error,
+        // never a panic.
+        let bytes = [1u8, 0, 0, 0, 99];
+        assert!(read_message(&mut &bytes[..]).is_err());
     }
 }
