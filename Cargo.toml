@@ -2,8 +2,16 @@
 name = "tmnl-protocol"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.85"
 description = "Binary wire protocol between the tmnl terminal and a backing app (e.g. mnml)."
+authors = ["Chris McLennan"]
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/chris-mclennan/tmnl-protocol"
+homepage = "https://github.com/chris-mclennan/tmnl-protocol"
+documentation = "https://docs.rs/tmnl-protocol"
+readme = "README.md"
+keywords = ["terminal", "protocol", "tui", "ipc", "tmnl"]
+categories = ["encoding", "network-programming"]
+exclude = [".local/", ".claude/", ".github/"]
 
 [dependencies]

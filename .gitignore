@@ -1,2 +1,5 @@
 /target
 Cargo.lock
+.claude/settings.local.json
+.claude/cache/
+.DS_Store

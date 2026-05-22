@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest a change to the protocol.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This crate is deliberately small and changes rarely — every change
+        ripples to the terminal and every backing app. New message types are
+        added at the end so older peers can ignore them.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: The use case behind the request.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: New message type, new field, new helper — and which peers it affects.
+    validations:
+      required: true
