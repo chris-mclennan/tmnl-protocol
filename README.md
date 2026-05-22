@@ -122,6 +122,7 @@ tmnl-protocol is one of a small family of terminal-native Rust tools:
 | [**mnml**](https://github.com/chris-mclennan/mnml) | A terminal IDE | speaks it as a backing app |
 | [**mixr**](https://github.com/chris-mclennan/mixr) | A terminal DJ app | speaks it as a backing app |
 | **tmnl-protocol** | The binary wire protocol | ← you are here |
+| [**fim-engine**](https://github.com/chris-mclennan/fim-engine) | Embedded code completion | local FIM, used by tmnl & mnml |
 
 ## Contributing
 
