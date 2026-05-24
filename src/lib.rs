@@ -614,6 +614,10 @@ pub fn read_message_with_fd<S: std::os::unix::io::AsRawFd>(
             // to learn how many fds rode in this cmsg.
             let data_ptr = unsafe { libc::CMSG_DATA(cmsg_ptr) };
             let hdr_size = unsafe { libc::CMSG_LEN(0) } as usize;
+            // `len` is `cmsg_len` — `socklen_t` (u32) on macOS, `usize`
+            // on Linux. The cast is mandatory on macOS but a no-op on
+            // Linux, hence the platform-aware allow.
+            #[allow(clippy::unnecessary_cast)]
             let data_len = (len as usize).saturating_sub(hdr_size);
             let n_fds = data_len / std::mem::size_of::<libc::c_int>();
             for i in 0..n_fds {
