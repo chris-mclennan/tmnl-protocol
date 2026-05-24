@@ -684,9 +684,7 @@ pub fn send_message_with_fd<S>(
 }
 
 #[cfg(not(unix))]
-pub fn read_message_with_fd<S>(
-    _stream: &S,
-) -> io::Result<(Message, Option<std::os::raw::c_int>)> {
+pub fn read_message_with_fd<S>(_stream: &S) -> io::Result<(Message, Option<std::os::raw::c_int>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "SCM_RIGHTS fd-passing is Unix-only",
@@ -1126,7 +1124,11 @@ mod tests {
         // Duplicate stdin → a fresh fd we can transfer without
         // disturbing the test process's actual stdin.
         let sent_fd = unsafe { libc::dup(libc::STDIN_FILENO) };
-        assert!(sent_fd >= 0, "dup failed: {}", std::io::Error::last_os_error());
+        assert!(
+            sent_fd >= 0,
+            "dup failed: {}",
+            std::io::Error::last_os_error()
+        );
 
         let msg = Message::OpenPaneTransfer {
             command: "claude".to_string(),
