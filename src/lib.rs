@@ -477,20 +477,24 @@ pub fn send_message_with_fd<S: std::os::unix::io::AsRawFd>(
     mhdr.msg_iovlen = 1;
 
     // The cmsg buffer — sized to hold exactly one fd's worth of
-    // SCM_RIGHTS payload. Stays on the stack via a fixed array so the
-    // pointer is valid for the sendmsg call.
-    // SAFETY: CMSG_SPACE returns the aligned byte count; the array is
-    // larger than any real platform's value (we pick 64 conservatively).
-    let mut cmsg_buf: [u8; 64] = [0u8; 64];
+    // SCM_RIGHTS payload. Must be aligned to `cmsghdr`'s alignment
+    // (8 bytes on 64-bit Linux + macOS) so the kernel's CMSG_*
+    // macros can dereference `cmsghdr` fields through pointers into
+    // it. `[u8; 64]` alone is 1-byte aligned — rustc's strict UB
+    // checker (Linux CI runners) caught this. `#[repr(align(8))]`
+    // wraps it without changing the byte count.
+    #[repr(align(8))]
+    struct CmsgBuf([u8; 64]);
+    let mut cmsg_buf = CmsgBuf([0u8; 64]);
 
     if let Some(fd) = fd {
         // SAFETY: libc::CMSG_SPACE is the standard cmsg-sizing call.
         let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) };
         let cmsg_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) };
-        if (cmsg_space as usize) > cmsg_buf.len() {
+        if (cmsg_space as usize) > cmsg_buf.0.len() {
             return Err(io::Error::other("cmsg buffer too small (recompile)"));
         }
-        mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        mhdr.msg_control = cmsg_buf.0.as_mut_ptr() as *mut libc::c_void;
         mhdr.msg_controllen = cmsg_space as _;
 
         // SAFETY: msg_control is non-null + msg_controllen ≥ CMSG_SPACE
@@ -549,7 +553,13 @@ pub fn read_message_with_fd<S: std::os::unix::io::AsRawFd>(
 ) -> io::Result<(Message, Option<std::os::unix::io::RawFd>)> {
     let sock_fd = stream.as_raw_fd();
     let mut data_buf = [0u8; 64 * 1024];
-    let mut cmsg_buf = [0u8; 64];
+    // Aligned cmsg buffer — see [`send_message_with_fd`] for the
+    // rationale. The kernel's CMSG_* macros require `cmsghdr`-aligned
+    // backing storage; a bare `[u8; 64]` is 1-byte aligned, which
+    // would UB-trap under strict rustc checks on Linux.
+    #[repr(align(8))]
+    struct CmsgBuf([u8; 64]);
+    let mut cmsg_buf = CmsgBuf([0u8; 64]);
 
     let mut iov = libc::iovec {
         iov_base: data_buf.as_mut_ptr() as *mut libc::c_void,
@@ -563,8 +573,8 @@ pub fn read_message_with_fd<S: std::os::unix::io::AsRawFd>(
     mhdr.msg_namelen = 0;
     mhdr.msg_iov = &mut iov;
     mhdr.msg_iovlen = 1;
-    mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    mhdr.msg_controllen = cmsg_buf.len() as _;
+    mhdr.msg_control = cmsg_buf.0.as_mut_ptr() as *mut libc::c_void;
+    mhdr.msg_controllen = cmsg_buf.0.len() as _;
 
     // SAFETY: mhdr is fully initialized for the recvmsg call.
     let received = unsafe { libc::recvmsg(sock_fd, &mut mhdr, 0) };
@@ -1187,13 +1197,15 @@ mod tests {
         let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
         mhdr.msg_iov = &mut iov;
         mhdr.msg_iovlen = 1;
-        // cmsg_buf big enough for two fds.
-        let mut cmsg_buf = [0u8; 64];
+        // cmsg_buf big enough for two fds — aligned to cmsghdr.
+        #[repr(align(8))]
+        struct CmsgBuf([u8; 64]);
+        let mut cmsg_buf = CmsgBuf([0u8; 64]);
         let cmsg_space =
             unsafe { libc::CMSG_SPACE(2 * std::mem::size_of::<libc::c_int>() as u32) } as usize;
         let cmsg_len =
             unsafe { libc::CMSG_LEN(2 * std::mem::size_of::<libc::c_int>() as u32) } as usize;
-        mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        mhdr.msg_control = cmsg_buf.0.as_mut_ptr() as *mut libc::c_void;
         mhdr.msg_controllen = cmsg_space as _;
         let cmsg_ptr = unsafe { libc::CMSG_FIRSTHDR(&mhdr) };
         unsafe {
