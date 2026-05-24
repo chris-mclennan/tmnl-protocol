@@ -5,7 +5,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MSG_HELLO: u8 = 1;
 pub const MSG_FRAME: u8 = 2;
 pub const MSG_RESIZE: u8 = 3;
@@ -28,6 +28,19 @@ pub const MSG_OPEN_PANE: u8 = 7;
 /// [`pack_rgba_u8`]). Sent right after the connect handshake. Added
 /// after v3 — optional; a client that ignores it keeps its own theme.
 pub const MSG_PALETTE: u8 = 8;
+/// `Message::OpenPaneTransfer { command, args }` — client → server.
+/// Like `OpenPane`, but signals that the SENDER has attached a pty
+/// master fd via SCM_RIGHTS ancillary data on the same `sendmsg(2)`
+/// call. The renderer takes ownership of that fd and uses it as the
+/// new pane's pty (instead of spawning a fresh process). Use case:
+/// pop-out a running CLI session (claude / codex / shell) from
+/// mnml's `Pane::Pty` into a dedicated tmnl tab without losing
+/// scrollback or restarting the child.
+///
+/// **Wire-byte layout is identical to `OpenPane`**; the difference is
+/// purely the tag + the cmsg-attached fd. See `DESIGN-FD-HANDOFF.md`.
+/// Added in protocol v4.
+pub const MSG_OPEN_PANE_TRANSFER: u8 = 9;
 
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
@@ -188,6 +201,17 @@ pub enum Message {
         fg: u32,
         accent: u32,
     },
+    /// Client → server: pty-fd handoff. Same shape as `OpenPane`, but
+    /// the sender attaches a pty master fd via SCM_RIGHTS ancillary
+    /// data on the same `sendmsg(2)`. The renderer takes ownership of
+    /// the fd and uses it as the new pane's pty. The byte layout is
+    /// identical to `OpenPane` — only the tag differs. See
+    /// [`send_message_with_fd`] / [`read_message_with_fd`] +
+    /// `DESIGN-FD-HANDOFF.md`.
+    OpenPaneTransfer {
+        command: String,
+        args: Vec<String>,
+    },
 }
 
 pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
@@ -259,6 +283,23 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
             buf.extend_from_slice(&bg.to_le_bytes());
             buf.extend_from_slice(&fg.to_le_bytes());
             buf.extend_from_slice(&accent.to_le_bytes());
+        }
+        Message::OpenPaneTransfer { command, args } => {
+            // Byte layout identical to OpenPane — only the tag differs.
+            // The accompanying fd rides via SCM_RIGHTS, not the byte
+            // stream. See [`send_message_with_fd`].
+            buf.push(MSG_OPEN_PANE_TRANSFER);
+            let cmd = command.as_bytes();
+            let cmd_len = (cmd.len() as u32).min(MAX_PAYLOAD.saturating_sub(8));
+            buf.extend_from_slice(&cmd_len.to_le_bytes());
+            buf.extend_from_slice(&cmd[..cmd_len as usize]);
+            buf.extend_from_slice(&(args.len() as u32).to_le_bytes());
+            for a in args {
+                let ab = a.as_bytes();
+                let al = (ab.len() as u32).min(MAX_PAYLOAD.saturating_sub(8));
+                buf.extend_from_slice(&al.to_le_bytes());
+                buf.extend_from_slice(&ab[..al as usize]);
+            }
         }
     }
     let payload_len = (buf.len() - 4) as u32;
@@ -365,40 +406,12 @@ fn decode_payload(p: &[u8]) -> io::Result<Message> {
             Ok(Message::Title(s))
         }
         MSG_OPEN_PANE => {
-            let cmd_len = c.u32()? as usize;
-            if cmd_len > 64 * 1024 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("absurd command len {cmd_len}"),
-                ));
-            }
-            let command = String::from_utf8(c.take(cmd_len)?.to_vec()).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bad utf-8 command: {e}"),
-                )
-            })?;
-            let n_args = c.u32()? as usize;
-            if n_args > 256 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("absurd arg count {n_args}"),
-                ));
-            }
-            let mut args = Vec::with_capacity(n_args);
-            for _ in 0..n_args {
-                let al = c.u32()? as usize;
-                if al > 64 * 1024 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("absurd arg len {al}"),
-                    ));
-                }
-                args.push(String::from_utf8(c.take(al)?.to_vec()).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("bad utf-8 arg: {e}"))
-                })?);
-            }
+            let (command, args) = decode_open_pane_payload(&mut c)?;
             Ok(Message::OpenPane { command, args })
+        }
+        MSG_OPEN_PANE_TRANSFER => {
+            let (command, args) = decode_open_pane_payload(&mut c)?;
+            Ok(Message::OpenPaneTransfer { command, args })
         }
         MSG_PALETTE => {
             let bg = c.u32()?;
@@ -411,6 +424,257 @@ fn decode_payload(p: &[u8]) -> io::Result<Message> {
             format!("unknown msg type {other}"),
         )),
     }
+}
+
+/// Shared decoder for the OpenPane / OpenPaneTransfer payload — same
+/// wire layout, different `Message` variant. Extracted to keep both
+/// match arms compact + their semantics aligned.
+/// Serialize a `Message` to its on-wire byte form — same shape
+/// `write_message` would write, returned as a `Vec<u8>` so callers can
+/// hand it to non-`Write` sinks (notably `libc::sendmsg`).
+pub fn encode_message(msg: &Message) -> Vec<u8> {
+    let mut sink: Vec<u8> = Vec::with_capacity(64);
+    // `write_message` returns `io::Result` but `Vec<u8>` never fails;
+    // unwrap is safe.
+    write_message(&mut sink, msg).expect("Vec<u8> write");
+    sink
+}
+
+/// Send a `Message` over a Unix-socket-backed stream, optionally
+/// attaching a single file descriptor via `SCM_RIGHTS` ancillary
+/// data. The receiver pulls the fd out via [`read_message_with_fd`].
+///
+/// `stream` is anything with `AsRawFd` whose underlying socket family
+/// supports `SCM_RIGHTS` (i.e. `AF_UNIX`). Passing a TCP socket here
+/// is a programmer error — the kernel will refuse the cmsg.
+///
+/// Used for the pty-fd handoff: see `DESIGN-FD-HANDOFF.md`. Generic
+/// otherwise — any future message that needs a side-channel fd can
+/// use the same helper.
+#[cfg(unix)]
+pub fn send_message_with_fd<S: std::os::unix::io::AsRawFd>(
+    stream: &S,
+    msg: &Message,
+    fd: Option<std::os::unix::io::RawFd>,
+) -> io::Result<()> {
+    let bytes = encode_message(msg);
+    let sock_fd = stream.as_raw_fd();
+
+    // iovec carrying the message bytes.
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+
+    // Set up the msghdr. Field order varies by platform — use a zeroed
+    // struct and assign fields by name so we don't trip on layout.
+    // SAFETY: zero-initialized is a valid `msghdr` (all pointers null,
+    // counts 0). We fill in the fields we care about before sendmsg.
+    let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    mhdr.msg_name = std::ptr::null_mut();
+    mhdr.msg_namelen = 0;
+    mhdr.msg_iov = &mut iov;
+    mhdr.msg_iovlen = 1;
+
+    // The cmsg buffer — sized to hold exactly one fd's worth of
+    // SCM_RIGHTS payload. Stays on the stack via a fixed array so the
+    // pointer is valid for the sendmsg call.
+    // SAFETY: CMSG_SPACE returns the aligned byte count; the array is
+    // larger than any real platform's value (we pick 64 conservatively).
+    let mut cmsg_buf: [u8; 64] = [0u8; 64];
+
+    if let Some(fd) = fd {
+        // SAFETY: libc::CMSG_SPACE is the standard cmsg-sizing call.
+        let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) };
+        let cmsg_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) };
+        if (cmsg_space as usize) > cmsg_buf.len() {
+            return Err(io::Error::other("cmsg buffer too small (recompile)"));
+        }
+        mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        mhdr.msg_controllen = cmsg_space as _;
+
+        // SAFETY: msg_control is non-null + msg_controllen ≥ CMSG_SPACE
+        // (asserted above). CMSG_FIRSTHDR returns a valid pointer.
+        let cmsg_ptr = unsafe { libc::CMSG_FIRSTHDR(&mhdr) };
+        if cmsg_ptr.is_null() {
+            return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
+        }
+        // SAFETY: we own the cmsg buffer; writing through the pointer is
+        // safe. cmsg_len / level / type are exact-fit values for SCM_RIGHTS.
+        unsafe {
+            (*cmsg_ptr).cmsg_len = cmsg_len as _;
+            (*cmsg_ptr).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg_ptr).cmsg_type = libc::SCM_RIGHTS;
+            // Copy the fd into the cmsg data slot.
+            std::ptr::copy_nonoverlapping(
+                &fd as *const std::os::unix::io::RawFd as *const u8,
+                libc::CMSG_DATA(cmsg_ptr),
+                std::mem::size_of::<libc::c_int>(),
+            );
+        }
+    }
+
+    // SAFETY: mhdr is fully initialized + valid for the sendmsg call.
+    let sent = unsafe { libc::sendmsg(sock_fd, &mhdr, 0) };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (sent as usize) != bytes.len() {
+        // Partial send — extremely unlikely on a SOCK_STREAM Unix
+        // socket for sub-page payloads, but report it as a hard error
+        // rather than re-trying (cmsg can't ride on a follow-up send).
+        return Err(io::Error::other(format!(
+            "sendmsg short write: {sent} of {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Receive a `Message` from a Unix-socket-backed stream, also pulling
+/// out the first file descriptor attached via `SCM_RIGHTS` ancillary
+/// data (if any). The fd's ownership transfers to the caller — close
+/// it (or wrap in `OwnedFd` / `UnixStream::from_raw_fd`) before it
+/// leaks.
+///
+/// Buffer sizing: the helper reads at most 64 KiB of message bytes in
+/// one `recvmsg` call. That's far above the payload of any wire
+/// message we emit (the largest is a Frame, which uses
+/// [`write_message`] / [`read_message`] over a streamed UnixStream,
+/// not this helper). Callers using `send_message_with_fd` for things
+/// other than `OpenPaneTransfer` should keep payloads short.
+#[cfg(unix)]
+pub fn read_message_with_fd<S: std::os::unix::io::AsRawFd>(
+    stream: &S,
+) -> io::Result<(Message, Option<std::os::unix::io::RawFd>)> {
+    let sock_fd = stream.as_raw_fd();
+    let mut data_buf = [0u8; 64 * 1024];
+    let mut cmsg_buf = [0u8; 64];
+
+    let mut iov = libc::iovec {
+        iov_base: data_buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: data_buf.len(),
+    };
+
+    // SAFETY: zero-initialized msghdr is well-formed. We populate the
+    // fields the recvmsg call reads before calling.
+    let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    mhdr.msg_name = std::ptr::null_mut();
+    mhdr.msg_namelen = 0;
+    mhdr.msg_iov = &mut iov;
+    mhdr.msg_iovlen = 1;
+    mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    mhdr.msg_controllen = cmsg_buf.len() as _;
+
+    // SAFETY: mhdr is fully initialized for the recvmsg call.
+    let received = unsafe { libc::recvmsg(sock_fd, &mut mhdr, 0) };
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if received == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed before message",
+        ));
+    }
+
+    // Pull the first attached fd (if any) out of the cmsg buffer.
+    let mut fd: Option<std::os::unix::io::RawFd> = None;
+    // SAFETY: msg_control was provided + recvmsg populates it.
+    let mut cmsg_ptr = unsafe { libc::CMSG_FIRSTHDR(&mhdr) };
+    while !cmsg_ptr.is_null() {
+        // SAFETY: cmsg_ptr is a valid cmsghdr returned by
+        // CMSG_FIRSTHDR / CMSG_NXTHDR.
+        let (level, ctype) = unsafe { ((*cmsg_ptr).cmsg_level, (*cmsg_ptr).cmsg_type) };
+        if level == libc::SOL_SOCKET && ctype == libc::SCM_RIGHTS {
+            // SAFETY: SCM_RIGHTS data is a sequence of c_int file
+            // descriptors. We take the first.
+            let data_ptr = unsafe { libc::CMSG_DATA(cmsg_ptr) };
+            let mut got_fd: std::os::unix::io::RawFd = -1;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data_ptr as *const u8,
+                    &mut got_fd as *mut std::os::unix::io::RawFd as *mut u8,
+                    std::mem::size_of::<libc::c_int>(),
+                );
+            }
+            if got_fd >= 0 {
+                fd = Some(got_fd);
+                break;
+            }
+        }
+        // SAFETY: CMSG_NXTHDR is the standard cmsg traversal call.
+        cmsg_ptr = unsafe { libc::CMSG_NXTHDR(&mhdr, cmsg_ptr) };
+    }
+
+    // Decode the message from the data buffer. `read_message` reads a
+    // length-prefixed framing; the in-memory buffer behaves like a
+    // Cursor<&[u8]> via `&data_buf[..received as usize]`.
+    let msg = read_message(&mut &data_buf[..received as usize])?;
+    Ok((msg, fd))
+}
+
+/// Non-Unix stub. SCM_RIGHTS is `AF_UNIX`-specific; on other platforms
+/// the helpers return `Unsupported`. They exist here so downstream
+/// code (mnml/tmnl) doesn't need its own cfg-fork — it just gets an
+/// `io::Error` instead of having to feature-gate the call.
+#[cfg(not(unix))]
+pub fn send_message_with_fd<S>(
+    _stream: &S,
+    _msg: &Message,
+    _fd: Option<std::os::raw::c_int>,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "SCM_RIGHTS fd-passing is Unix-only",
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn read_message_with_fd<S>(
+    _stream: &S,
+) -> io::Result<(Message, Option<std::os::raw::c_int>)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "SCM_RIGHTS fd-passing is Unix-only",
+    ))
+}
+
+fn decode_open_pane_payload(c: &mut Cursor<'_>) -> io::Result<(String, Vec<String>)> {
+    let cmd_len = c.u32()? as usize;
+    if cmd_len > 64 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("absurd command len {cmd_len}"),
+        ));
+    }
+    let command = String::from_utf8(c.take(cmd_len)?.to_vec()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad utf-8 command: {e}"),
+        )
+    })?;
+    let n_args = c.u32()? as usize;
+    if n_args > 256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("absurd arg count {n_args}"),
+        ));
+    }
+    let mut args = Vec::with_capacity(n_args);
+    for _ in 0..n_args {
+        let al = c.u32()? as usize;
+        if al > 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("absurd arg len {al}"),
+            ));
+        }
+        args.push(String::from_utf8(c.take(al)?.to_vec()).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("bad utf-8 arg: {e}"))
+        })?);
+    }
+    Ok((command, args))
 }
 
 fn encode_input(buf: &mut Vec<u8>, ev: &InputEvent) {
@@ -777,5 +1041,75 @@ mod tests {
         // never a panic.
         let bytes = [1u8, 0, 0, 0, 99];
         assert!(read_message(&mut &bytes[..]).is_err());
+    }
+
+    #[test]
+    fn open_pane_transfer_round_trips_via_write_message() {
+        // The new variant's byte encoding is reachable via the regular
+        // `write_message` / `read_message` path — the fd-transfer
+        // semantic is layered on top via send/read_message_with_fd.
+        round_trip(Message::OpenPaneTransfer {
+            command: "claude".to_string(),
+            args: vec!["--model".into(), "opus".into()],
+        });
+        round_trip(Message::OpenPaneTransfer {
+            command: "/usr/bin/env".to_string(),
+            args: vec![],
+        });
+    }
+
+    /// SCM_RIGHTS round-trip — sender attaches one fd, receiver pulls
+    /// it out + decodes the message. Uses a `socketpair(AF_UNIX,
+    /// SOCK_STREAM)` so the two ends share the same process. The fd
+    /// we pass is `STDIN_FILENO` duplicated — cheap + always available.
+    #[cfg(unix)]
+    #[test]
+    fn fd_passing_round_trips_message_and_fd() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (a, b) = UnixStream::pair().expect("socketpair");
+
+        // Duplicate stdin → a fresh fd we can transfer without
+        // disturbing the test process's actual stdin.
+        let sent_fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+        assert!(sent_fd >= 0, "dup failed: {}", std::io::Error::last_os_error());
+
+        let msg = Message::OpenPaneTransfer {
+            command: "claude".to_string(),
+            args: vec!["--model".into(), "opus".into()],
+        };
+        send_message_with_fd(&a, &msg, Some(sent_fd)).expect("send");
+
+        let (got_msg, got_fd) = read_message_with_fd(&b).expect("recv");
+        assert_eq!(got_msg, msg);
+        assert!(got_fd.is_some(), "expected an attached fd");
+
+        // Close both copies of the transferred fd (sender's + receiver's
+        // — SCM_RIGHTS dup'd it across processes; both sides own a copy).
+        unsafe {
+            libc::close(sent_fd);
+        }
+        // Wrap the received fd in an OwnedFd-style holder to ensure it
+        // closes when dropped — using UnixStream::from_raw_fd is the
+        // simplest way (stdin works fine as a "stream" for close-on-drop).
+        let _drop_me = unsafe { std::fs::File::from_raw_fd(got_fd.unwrap()) };
+    }
+
+    /// `send_message_with_fd(stream, msg, None)` should still work —
+    /// no ancillary data, the receiver gets `Some(msg), None`.
+    #[cfg(unix)]
+    #[test]
+    fn fd_passing_round_trips_message_without_fd() {
+        use std::os::unix::net::UnixStream;
+
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let msg = Message::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        send_message_with_fd(&a, &msg, None).expect("send");
+        let (got_msg, got_fd) = read_message_with_fd(&b).expect("recv");
+        assert_eq!(got_msg, msg);
+        assert!(got_fd.is_none());
     }
 }

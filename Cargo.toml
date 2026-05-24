@@ -1,6 +1,6 @@
 [package]
 name = "tmnl-protocol"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Binary wire protocol between the tmnl terminal and a backing app (e.g. mnml)"
@@ -15,3 +15,9 @@ categories = ["encoding", "network-programming"]
 exclude = [".local/", ".claude/", ".github/"]
 
 [dependencies]
+# For SCM_RIGHTS fd-passing (`send_message_with_fd` /
+# `read_message_with_fd`) — pty handoff use case, see DESIGN-FD-HANDOFF.md.
+# Unix-only; ignored on other platforms (the fd helpers are
+# `#[cfg(unix)]` gated).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
