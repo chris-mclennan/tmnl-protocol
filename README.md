@@ -2,7 +2,7 @@
 
 # tmnl-protocol
 
-**The binary wire protocol between the [tmnl](https://github.com/chris-mclennan/tmnl-rs)
+**The binary wire protocol between the [tmnl](https://github.com/chris-mclennan/tmnl)
 terminal and a backing app.**
 
 A small, dependency-free, length-prefixed message format. tmnl renders the cells;
@@ -22,7 +22,7 @@ In tmnl's **native mode**, an app doesn't emit ANSI escape codes — it sends
 *structured cells* over a Unix socket. `tmnl-protocol` is the wire format for
 that channel: a handful of message types, a binary cell layout, and a diff-run
 frame encoding. It is the single source of truth shared by the `tmnl` renderer
-and every backing app (such as [`mnml`](https://github.com/chris-mclennan/mnml-rs)).
+and every backing app (such as [`mnml`](https://github.com/chris-mclennan/mnml)).
 
 Zero dependencies. Pure `std`. Just types and two functions.
 
@@ -118,9 +118,9 @@ tmnl-protocol is one of a small family of terminal-native Rust tools:
 
 | Project | What it is | |
 |---------|-----------|--|
-| [**tmnl**](https://github.com/chris-mclennan/tmnl-rs) | A GPU-accelerated terminal | speaks this protocol as the server |
-| [**mnml**](https://github.com/chris-mclennan/mnml-rs) | A terminal IDE | speaks it as a backing app |
-| [**mixr**](https://github.com/chris-mclennan/mixr-rs) | A terminal DJ app | speaks it as a backing app |
+| [**tmnl**](https://github.com/chris-mclennan/tmnl) | A GPU-accelerated terminal | speaks this protocol as the server |
+| [**mnml**](https://github.com/chris-mclennan/mnml) | A terminal IDE | speaks it as a backing app |
+| [**mixr**](https://github.com/chris-mclennan/mixr) | A terminal DJ app | speaks it as a backing app |
 | **tmnl-protocol** | The binary wire protocol | ← you are here |
 | [**fim-engine**](https://github.com/chris-mclennan/fim-engine) | Embedded code completion | local FIM, used by tmnl & mnml |
 
