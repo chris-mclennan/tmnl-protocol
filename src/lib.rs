@@ -41,6 +41,16 @@ pub const MSG_PALETTE: u8 = 8;
 /// purely the tag + the cmsg-attached fd. See `DESIGN-FD-HANDOFF.md`.
 /// Added in protocol v4.
 pub const MSG_OPEN_PANE_TRANSFER: u8 = 9;
+/// `Message::RunHostCommand(String)` — client → server. The hosted
+/// app (e.g. mnml) asks the renderer (tmnl) to fire a command from
+/// the renderer's own command registry by id. Use case: mnml's
+/// `[[ui.integration_icon]]` left-rail chips with a `tmnl:<cmd-id>`
+/// command field — clicking the chip sends one of these messages
+/// so tmnl can run e.g. `browser.attach_dashboard` or
+/// `split.browser_clipboard` without mnml needing to know the
+/// command's implementation. Added after v4 — optional on older
+/// renderers (they'll ignore unknown tags).
+pub const MSG_RUN_HOST_COMMAND: u8 = 10;
 
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
@@ -212,6 +222,11 @@ pub enum Message {
         command: String,
         args: Vec<String>,
     },
+    /// Client → server: fire a renderer-side command by id. The
+    /// hosted app doesn't need to know what the id maps to — the
+    /// renderer looks it up in its own command registry. See
+    /// [`MSG_RUN_HOST_COMMAND`].
+    RunHostCommand(String),
 }
 
 pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
@@ -300,6 +315,13 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
                 buf.extend_from_slice(&al.to_le_bytes());
                 buf.extend_from_slice(&ab[..al as usize]);
             }
+        }
+        Message::RunHostCommand(id) => {
+            buf.push(MSG_RUN_HOST_COMMAND);
+            let s = id.as_bytes();
+            let s_len = (s.len() as u32).min(MAX_PAYLOAD.saturating_sub(8));
+            buf.extend_from_slice(&s_len.to_le_bytes());
+            buf.extend_from_slice(&s[..s_len as usize]);
         }
     }
     let payload_len = (buf.len() - 4) as u32;
@@ -418,6 +440,13 @@ fn decode_payload(p: &[u8]) -> io::Result<Message> {
             let fg = c.u32()?;
             let accent = c.u32()?;
             Ok(Message::Palette { bg, fg, accent })
+        }
+        MSG_RUN_HOST_COMMAND => {
+            let len = c.u32()? as usize;
+            let bytes = c.take(len)?;
+            let s = String::from_utf8(bytes.to_vec())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(Message::RunHostCommand(s))
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -982,6 +1011,14 @@ mod tests {
             fg: pack_rgba_u8(0xab, 0xb2, 0xbf, 0xff),
             accent: pack_rgba_u8(0x61, 0xaf, 0xef, 0xff),
         });
+    }
+
+    #[test]
+    fn run_host_command_round_trips() {
+        round_trip(Message::RunHostCommand(
+            "browser.attach_dashboard".to_string(),
+        ));
+        round_trip(Message::RunHostCommand(String::new()));
     }
 
     #[test]
