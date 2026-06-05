@@ -372,7 +372,11 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
             let n = items.len() as u32;
             buf.extend_from_slice(&n.to_le_bytes());
             for item in items {
-                for s in [item.id.as_bytes(), item.title.as_bytes(), item.group.as_bytes()] {
+                for s in [
+                    item.id.as_bytes(),
+                    item.title.as_bytes(),
+                    item.group.as_bytes(),
+                ] {
                     let s_len = (s.len() as u32).min(u16::MAX as u32);
                     buf.extend_from_slice(&s_len.to_le_bytes());
                     buf.extend_from_slice(&s[..s_len as usize]);
