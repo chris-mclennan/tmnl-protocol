@@ -52,6 +52,22 @@ pub const MSG_OPEN_PANE_TRANSFER: u8 = 9;
 /// renderers (they'll ignore unknown tags).
 pub const MSG_RUN_HOST_COMMAND: u8 = 10;
 
+/// Host → client: "list every command you expose". Sent by tmnl
+/// when its command palette opens. The client should reply with
+/// [`MSG_CLIENT_COMMANDS`].
+pub const MSG_LIST_CLIENT_COMMANDS: u8 = 11;
+
+/// Client → host: the client's command registry, as a flat list of
+/// `(id, title, group)` items. Tmnl aggregates these alongside its
+/// own commands in the palette overlay.
+pub const MSG_CLIENT_COMMANDS: u8 = 12;
+
+/// Host → client: invoke a command by id from the client's
+/// registry. Fired when the user picks a remote command from
+/// tmnl's palette. The client looks the id up in its own registry
+/// and runs it.
+pub const MSG_RUN_CLIENT_COMMAND: u8 = 13;
+
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
@@ -227,6 +243,29 @@ pub enum Message {
     /// renderer looks it up in its own command registry. See
     /// [`MSG_RUN_HOST_COMMAND`].
     RunHostCommand(String),
+    /// Server → client: "send me your command registry." Sent when
+    /// tmnl's palette overlay opens so it can aggregate remote
+    /// commands alongside its own. See [`MSG_LIST_CLIENT_COMMANDS`].
+    ListClientCommands,
+    /// Client → server: the response to [`Self::ListClientCommands`].
+    /// Each entry is one command the client exposes.
+    ClientCommands(Vec<CommandInfo>),
+    /// Server → client: invoke a client-registered command by id.
+    /// The id is opaque to tmnl — it just forwards what the client
+    /// gave it in [`Self::ClientCommands`]. See
+    /// [`MSG_RUN_CLIENT_COMMAND`].
+    RunClientCommand(String),
+}
+
+/// One command entry from a client's registry. Sent in batches via
+/// [`Message::ClientCommands`]. The host renders `title` (and optionally
+/// `group` as a prefix) in its palette, and sends `id` back via
+/// [`Message::RunClientCommand`] when the user picks the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandInfo {
+    pub id: String,
+    pub title: String,
+    pub group: String,
 }
 
 pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
@@ -318,6 +357,30 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
         }
         Message::RunHostCommand(id) => {
             buf.push(MSG_RUN_HOST_COMMAND);
+            let s = id.as_bytes();
+            let s_len = (s.len() as u32).min(MAX_PAYLOAD.saturating_sub(8));
+            buf.extend_from_slice(&s_len.to_le_bytes());
+            buf.extend_from_slice(&s[..s_len as usize]);
+        }
+        Message::ListClientCommands => {
+            buf.push(MSG_LIST_CLIENT_COMMANDS);
+        }
+        Message::ClientCommands(items) => {
+            buf.push(MSG_CLIENT_COMMANDS);
+            // Count, then a flat list of (id_len, id, title_len, title,
+            // group_len, group) triples.
+            let n = items.len() as u32;
+            buf.extend_from_slice(&n.to_le_bytes());
+            for item in items {
+                for s in [item.id.as_bytes(), item.title.as_bytes(), item.group.as_bytes()] {
+                    let s_len = (s.len() as u32).min(u16::MAX as u32);
+                    buf.extend_from_slice(&s_len.to_le_bytes());
+                    buf.extend_from_slice(&s[..s_len as usize]);
+                }
+            }
+        }
+        Message::RunClientCommand(id) => {
+            buf.push(MSG_RUN_CLIENT_COMMAND);
             let s = id.as_bytes();
             let s_len = (s.len() as u32).min(MAX_PAYLOAD.saturating_sub(8));
             buf.extend_from_slice(&s_len.to_le_bytes());
@@ -447,6 +510,30 @@ fn decode_payload(p: &[u8]) -> io::Result<Message> {
             let s = String::from_utf8(bytes.to_vec())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Ok(Message::RunHostCommand(s))
+        }
+        MSG_LIST_CLIENT_COMMANDS => Ok(Message::ListClientCommands),
+        MSG_CLIENT_COMMANDS => {
+            let n = c.u32()? as usize;
+            let mut items: Vec<CommandInfo> = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                let mut three: [String; 3] = [String::new(), String::new(), String::new()];
+                for slot in three.iter_mut() {
+                    let len = c.u32()? as usize;
+                    let bytes = c.take(len)?;
+                    *slot = String::from_utf8(bytes.to_vec())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                }
+                let [id, title, group] = three;
+                items.push(CommandInfo { id, title, group });
+            }
+            Ok(Message::ClientCommands(items))
+        }
+        MSG_RUN_CLIENT_COMMAND => {
+            let len = c.u32()? as usize;
+            let bytes = c.take(len)?;
+            let s = String::from_utf8(bytes.to_vec())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(Message::RunClientCommand(s))
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -978,6 +1065,40 @@ mod tests {
             rows: 60,
         }));
         round_trip(Message::Resize(Resize { cols: 0, rows: 0 }));
+    }
+
+    #[test]
+    fn list_client_commands_round_trips() {
+        round_trip(Message::ListClientCommands);
+    }
+
+    #[test]
+    fn client_commands_round_trips_empty_and_populated() {
+        round_trip(Message::ClientCommands(vec![]));
+        round_trip(Message::ClientCommands(vec![
+            CommandInfo {
+                id: "file.save".into(),
+                title: "Save file".into(),
+                group: "File".into(),
+            },
+            CommandInfo {
+                id: "deck.play".into(),
+                title: "Play deck A".into(),
+                group: "Mixr".into(),
+            },
+            CommandInfo {
+                // Stress unicode + long titles.
+                id: "ai.claude_code".into(),
+                title: "Open Claude Code session — current pane".into(),
+                group: "AI".into(),
+            },
+        ]));
+    }
+
+    #[test]
+    fn run_client_command_round_trips() {
+        round_trip(Message::RunClientCommand("git.commit".into()));
+        round_trip(Message::RunClientCommand(String::new()));
     }
 
     #[test]
