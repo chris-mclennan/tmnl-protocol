@@ -5,7 +5,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MSG_HELLO: u8 = 1;
 pub const MSG_FRAME: u8 = 2;
 pub const MSG_RESIZE: u8 = 3;
@@ -67,6 +67,15 @@ pub const MSG_CLIENT_COMMANDS: u8 = 12;
 /// tmnl's palette. The client looks the id up in its own registry
 /// and runs it.
 pub const MSG_RUN_CLIENT_COMMAND: u8 = 13;
+
+/// `Message::OpenFile { path }` — client → server. The hosted app
+/// asks the renderer / host to open `path` in its editor. Use case:
+/// `mnml-fs-s3` downloads an S3 object to `~/.cache/mnml-fs-s3/...`
+/// and emits this message so mnml-as-host opens the local file in
+/// an editor pane. The S3 browser pane stays focused; the user
+/// `Tab`s between the editor + the browser. Added in protocol v5
+/// — optional on older renderers (they ignore unknown tags).
+pub const MSG_OPEN_FILE: u8 = 14;
 
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
@@ -255,6 +264,14 @@ pub enum Message {
     /// gave it in [`Self::ClientCommands`]. See
     /// [`MSG_RUN_CLIENT_COMMAND`].
     RunClientCommand(String),
+    /// Client → server: open `path` in the host's editor. Used by
+    /// hosted apps that produce / download files (S3 browser, db
+    /// query result exports, etc.) to hand off to mnml's editor
+    /// without losing the hosted pane's state. See
+    /// [`MSG_OPEN_FILE`].
+    OpenFile {
+        path: String,
+    },
 }
 
 /// One command entry from a client's registry. Sent in batches via
@@ -382,6 +399,13 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> io::Result<()> {
                     buf.extend_from_slice(&s[..s_len as usize]);
                 }
             }
+        }
+        Message::OpenFile { path } => {
+            buf.push(MSG_OPEN_FILE);
+            let s = path.as_bytes();
+            let s_len = (s.len() as u32).min(MAX_PAYLOAD.saturating_sub(8));
+            buf.extend_from_slice(&s_len.to_le_bytes());
+            buf.extend_from_slice(&s[..s_len as usize]);
         }
         Message::RunClientCommand(id) => {
             buf.push(MSG_RUN_CLIENT_COMMAND);
@@ -531,6 +555,13 @@ fn decode_payload(p: &[u8]) -> io::Result<Message> {
                 items.push(CommandInfo { id, title, group });
             }
             Ok(Message::ClientCommands(items))
+        }
+        MSG_OPEN_FILE => {
+            let len = c.u32()? as usize;
+            let bytes = c.take(len)?;
+            let path = String::from_utf8(bytes.to_vec())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(Message::OpenFile { path })
         }
         MSG_RUN_CLIENT_COMMAND => {
             let len = c.u32()? as usize;
@@ -1126,6 +1157,19 @@ mod tests {
         round_trip(Message::OpenPane {
             command: "sh".to_string(),
             args: vec![],
+        });
+    }
+
+    #[test]
+    fn open_file_round_trips() {
+        round_trip(Message::OpenFile {
+            path: "/home/user/.cache/mnml-fs-s3/my-bucket/logs/2026/build.log".to_string(),
+        });
+        round_trip(Message::OpenFile {
+            path: String::new(),
+        });
+        round_trip(Message::OpenFile {
+            path: "/path with spaces/file.txt".to_string(),
         });
     }
 
